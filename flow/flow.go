@@ -46,11 +46,59 @@ var openFlowsNumber = uint32(0)
 var ringName = 1
 var createdPorts []port
 var schedState *scheduler
+var vEach [10][burstSize]uint8
+
+type processLine struct {
+	out      []*low.Ring
+	contexts []*UserContext
+}
 
 // Flow is an abstraction for connecting flow functions with each other.
 // Flow shouldn't be understood in any way beyond this.
 type Flow struct {
-	current *low.Ring
+	current  *low.Ring
+	line     *processLine
+	previous **sFunc
+}
+
+type partitionCtx struct {
+	currentAnswer       int
+	currentCompare      uint64
+	currentPacketNumber uint64
+	N                   uint64
+	M                   uint64
+}
+
+func (c partitionCtx) Copy() interface{} {
+	n := new(partitionCtx)
+	n.N = c.N
+	n.M = c.M
+	n.currentCompare = c.N
+	return n
+}
+
+func (c partitionCtx) Delete() {
+}
+
+type sFunc struct {
+	handleFunction   HandleFunction
+	separateFunction SeparateFunction
+	splitFunction    SplitFunction
+	Func             func(*packet.Packet, *sFunc, UserContext) int
+	next             [](*sFunc)
+	bufIndex         int
+	contextIndex     int
+}
+
+type vFunc struct {
+	handleFunction   VectorHandleFunction
+	separateFunction VectorSeparateFunction
+	splitFunction    VectorSplitFunction
+	Func             func([]*packet.Packet, *[burstSize]bool, *[burstSize]uint8, *vFunc)
+	next             [](*vFunc)
+	bufIndex         int
+	contextIndex     int
+	followingNumber  uint8
 }
 
 // GenerateFunction is a function type for user defined function which generates packets.
@@ -68,7 +116,7 @@ type VectorGenerateFunction func([]*packet.Packet, uint, UserContext)
 type HandleFunction func(*packet.Packet, UserContext)
 
 // VectorHandleFunction is a function type like GenerateFunction for vector handling
-type VectorHandleFunction func([]*packet.Packet, uint, UserContext)
+type VectorHandleFunction func([]*packet.Packet, *[burstSize]bool, *[burstSize]uint8, UserContext)
 
 // SeparateFunction is a function type for user defined function which separates packets
 // based on some rule for two flows. Functions receives a packet from flow.
@@ -77,7 +125,7 @@ type VectorHandleFunction func([]*packet.Packet, uint, UserContext)
 type SeparateFunction func(*packet.Packet, UserContext) bool
 
 // VectorSeparateFunction is a function type like GenerateFunction for vector separation
-type VectorSeparateFunction func([]*packet.Packet, []bool, uint, UserContext)
+type VectorSeparateFunction func([]*packet.Packet, *[burstSize]bool, *[burstSize]uint8, UserContext)
 
 // SplitFunction is a function type for user defined function which splits packets
 // based in some rule for multiple flows. Function receives a packet from
@@ -87,6 +135,8 @@ type VectorSeparateFunction func([]*packet.Packet, []bool, uint, UserContext)
 // output flow is used for dropping packets - "Stop" function should be
 // set after "Split" function in it.
 type SplitFunction func(*packet.Packet, UserContext) uint
+
+type VectorSplitFunction func([]*packet.Packet, *[burstSize]bool, *[burstSize]uint8, UserContext)
 
 // Kni is a high level struct of KNI device. The device itself is stored
 // in C memory in low.c and is defined by its port which is equal to port
@@ -136,7 +186,9 @@ func addFastGenerator(out *low.Ring, generateFunction GenerateFunction,
 	par.mempool = low.CreateMempool()
 	par.vectorGenerateFunction = vectorGenerateFunction
 	par.targetSpeed = float64(targetSpeed)
-	schedState.addFF("fast generator", nil, nil, generatePerf, par, make(chan uint64, 50), context, fastGenerate)
+	ctx := make([]UserContext, 1, 1)
+	ctx[0] = context
+	schedState.addFF("fast generator", nil, nil, generatePerf, par, make(chan uint64, 50), &ctx, fastGenerate)
 }
 
 type sendParameters struct {
@@ -166,80 +218,39 @@ func addCopier(in *low.Ring, out *low.Ring, outCopy *low.Ring) {
 	par.out = out
 	par.outCopy = outCopy
 	par.mempool = low.CreateMempool()
-	schedState.addFF("copy", nil, nil, pcopy, par, make(chan uint64, 50), nil, handleSplitSeparateCopy)
+	schedState.addFF("copy", nil, nil, pcopy, par, make(chan uint64, 50), nil, lineCopy)
 }
 
-type partitionParameters struct {
-	in        *low.Ring
-	outFirst  *low.Ring
-	outSecond *low.Ring
-	N         uint64
-	M         uint64
+// TODO add vector partitioner
+func makePartitioner(N uint64, M uint64) *sFunc {
+	f := new(sFunc)
+	f.Func = partition
+	f.next = make([]*sFunc, 2, 2)
+	return f
 }
 
-func addPartitioner(in *low.Ring, outFirst *low.Ring, outSecond *low.Ring, N uint64, M uint64) {
-	par := new(partitionParameters)
-	par.in = in
-	par.outFirst = outFirst
-	par.outSecond = outSecond
-	par.N = N
-	par.M = M
-	schedState.addFF("partitioner", partition, nil, nil, par, nil, nil, other)
+func makeSeparator(separateFunction SeparateFunction) *sFunc {
+	f := new(sFunc)
+	f.separateFunction = separateFunction
+	f.Func = separate
+	f.next = make([]*sFunc, 2, 2)
+	return f
 }
 
-type separateParameters struct {
-	in                     *low.Ring
-	outTrue                *low.Ring
-	outFalse               *low.Ring
-	separateFunction       SeparateFunction
-	vectorSeparateFunction VectorSeparateFunction
+func makeSplitter(splitFunction SplitFunction) *sFunc {
+	f := new(sFunc)
+	f.splitFunction = splitFunction
+	f.Func = split
+	f.next = make([]*sFunc, 20, 20) // TODO parameter
+	return f
 }
 
-func addSeparator(in *low.Ring, outTrue *low.Ring, outFalse *low.Ring,
-	separateFunction SeparateFunction, vectorSeparateFunction VectorSeparateFunction,
-	name string, context UserContext) {
-	par := new(separateParameters)
-	par.in = in
-	par.outTrue = outTrue
-	par.outFalse = outFalse
-	par.separateFunction = separateFunction
-	par.vectorSeparateFunction = vectorSeparateFunction
-	schedState.addFF(name, nil, nil, separate, par, make(chan uint64, 50), context, handleSplitSeparateCopy)
-}
-
-type splitParameters struct {
-	in            *low.Ring
-	outs          []*low.Ring
-	splitFunction SplitFunction
-	flowNumber    uint
-}
-
-func addSplitter(in *low.Ring, outs []*low.Ring,
-	splitFunction SplitFunction, flowNumber uint, context UserContext) {
-	par := new(splitParameters)
-	par.in = in
-	par.outs = outs
-	par.splitFunction = splitFunction
-	par.flowNumber = flowNumber
-	schedState.addFF("splitter", nil, nil, split, par, make(chan uint64, 50), context, handleSplitSeparateCopy)
-}
-
-type handleParameters struct {
-	in                   *low.Ring
-	out                  *low.Ring
-	handleFunction       HandleFunction
-	vectorHandleFunction VectorHandleFunction
-}
-
-func addHandler(in *low.Ring, out *low.Ring,
-	handleFunction HandleFunction, vectorHandleFunction VectorHandleFunction,
-	name string, context UserContext) {
-	par := new(handleParameters)
-	par.in = in
-	par.out = out
-	par.handleFunction = handleFunction
-	par.vectorHandleFunction = vectorHandleFunction
-	schedState.addFF(name, nil, nil, handle, par, make(chan uint64, 50), context, handleSplitSeparateCopy)
+func makeHandler(handleFunction HandleFunction) *sFunc {
+	f := new(sFunc)
+	f.handleFunction = handleFunction
+	f.Func = handle
+	f.next = make([]*sFunc, 1, 1)
+	return f
 }
 
 type writeParameters struct {
@@ -268,7 +279,35 @@ func addReader(filename string, out *low.Ring, repcount int32) {
 	schedState.addFF("reader", read, nil, nil, par, nil, nil, other)
 }
 
-var burstSize uint
+func makeSlice(out *low.Ring, line *processLine) *sFunc {
+	f := new(sFunc)
+	f.Func = constructSlice
+	line.out = append(line.out, out)
+	f.bufIndex = len(line.out)
+	return f
+}
+
+type lineParameters struct {
+	in         *low.Ring
+	out        *([](*low.Ring))
+	firstSFunc *sFunc
+	firstVFunc *vFunc
+}
+
+func addLine(in *low.Ring, firstS *sFunc) *processLine {
+	par := new(lineParameters)
+	par.in = in
+	par.firstSFunc = firstS
+	line := new(processLine)
+	line.out = make([](*low.Ring), 0, 0)
+	line.contexts = make([](*UserContext), 0, 0)
+	par.out = &line.out
+	schedState.addFF("line", nil, nil, lineProcess, par, make(chan uint64, 50), nil, lineCopy)
+	return line
+}
+
+const burstSize = 32
+
 var sizeMultiplier uint
 var schedTime uint
 var hwtxchecksum bool
@@ -306,16 +345,12 @@ type Config struct {
 	// Specifies number of mbufs in per-CPU core cache in
 	// mempool. Default value is 250.
 	MbufCacheSize uint
-	// Number of BurstSize groups in all rings. This should be power
+	// Number of burstSize groups in all rings. This should be power
 	// of 2. Default value is 256.
 	RingSize uint
 	// Time between scheduler actions in miliseconds. Default value is
 	// 1500.
 	ScaleTime uint
-	// Number of mbufs per one enqueue / dequeue from ring. Default
-	// value is tested for performance and not recommended to
-	// change. Default value is 32.
-	BurstSize uint
 	// Time in miliseconds for scheduler to check changing of flow
 	// function behaviour. Default value is 10000.
 	CheckTime uint
@@ -370,11 +405,6 @@ func SystemInit(args *Config) error {
 		schedTime = args.ScaleTime
 	}
 
-	burstSize = 32
-	if args.BurstSize != 0 {
-		burstSize = args.BurstSize
-	}
-
 	checkTime := uint(10000)
 	if args.CheckTime != 0 {
 		checkTime = args.CheckTime
@@ -423,6 +453,11 @@ func SystemInit(args *Config) error {
 	packet.SetHWTXChecksumFlag(hwtxchecksum)
 	// Init low performance mempool
 	packet.SetNonPerfMempool(low.CreateMempool())
+	for i := 0; i < 10; i++ {
+		for j := 0; j < burstSize; j++ {
+			vEach[i][j] = uint8(i)
+		}
+	}
 	return nil
 }
 
@@ -472,9 +507,7 @@ func SetSenderFile(IN *Flow, filename string) error {
 	if err := checkFlow(IN); err != nil {
 		return err
 	}
-	addWriter(filename, IN.current)
-	IN.current = nil
-	openFlowsNumber--
+	addWriter(filename, finishFlow(IN))
 	return nil
 }
 
@@ -486,10 +519,7 @@ func SetSenderFile(IN *Flow, filename string) error {
 func SetReceiverFile(filename string, repcount int32) (OUT *Flow) {
 	ring := low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
 	addReader(filename, ring, repcount)
-	OUT = new(Flow)
-	OUT.current = ring
-	openFlowsNumber++
-	return OUT
+	return newFlow(ring)
 }
 
 // SetReceiver adds receive function to flow graph.
@@ -508,10 +538,7 @@ func SetReceiver(portId uint8) (OUT *Flow, err error) {
 	createdPorts[portId].willReceive = true
 	ring := low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
 	addReceiver(portId, false, ring)
-	OUT = new(Flow)
-	OUT.current = ring
-	openFlowsNumber++
-	return OUT, nil
+	return newFlow(ring), nil
 }
 
 // SetReceiverKNI adds function receive from KNI to flow graph.
@@ -522,10 +549,7 @@ func SetReceiver(portId uint8) (OUT *Flow, err error) {
 func SetReceiverKNI(kni *Kni) (OUT *Flow) {
 	ring := low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
 	addReceiver(kni.portId, true, ring)
-	OUT = new(Flow)
-	OUT.current = ring
-	openFlowsNumber++
-	return OUT
+	return newFlow(ring)
 }
 
 // SetFastGenerator adds clonable generate function to flow graph.
@@ -540,10 +564,7 @@ func SetFastGenerator(f func(*packet.Packet, UserContext), targetSpeed uint64, c
 	} else {
 		return nil, common.WrapWithNFError(nil, "Target speed value should be > 0", common.BadArgument)
 	}
-	OUT = new(Flow)
-	OUT.current = ring
-	openFlowsNumber++
-	return OUT, nil
+	return newFlow(ring), nil
 }
 
 // SetVectorFastGenerator adds clonable vector generate function to flow graph.
@@ -558,10 +579,7 @@ func SetVectorFastGenerator(f func([]*packet.Packet, uint, UserContext), targetS
 	} else {
 		return nil, common.WrapWithNFError(nil, "Target speed value should be > 0", common.BadArgument)
 	}
-	OUT = new(Flow)
-	OUT.current = ring
-	openFlowsNumber++
-	return OUT, nil
+	return newFlow(ring), nil
 }
 
 // SetGenerator adds non-clonable generate flow function to flow graph.
@@ -573,10 +591,7 @@ func SetVectorFastGenerator(f func([]*packet.Packet, uint, UserContext), targetS
 func SetGenerator(f func(*packet.Packet, UserContext), context UserContext) (OUT *Flow) {
 	ring := low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
 	addGenerator(ring, GenerateFunction(f))
-	OUT = new(Flow)
-	OUT.current = ring
-	openFlowsNumber++
-	return OUT
+	return newFlow(ring)
 }
 
 // SetSender adds send function to flow graph.
@@ -591,10 +606,8 @@ func SetSender(IN *Flow, portId uint8) error {
 		return common.WrapWithNFError(nil, "Requested send port exceeds number of ports which can be used by DPDK (bind to DPDK).", common.ReqTooManyPorts)
 	}
 	createdPorts[portId].wasRequested = true
-	addSender(portId, createdPorts[portId].txQueuesNumber, IN.current)
+	addSender(portId, createdPorts[portId].txQueuesNumber, finishFlow(IN))
 	createdPorts[portId].txQueuesNumber++
-	IN.current = nil
-	openFlowsNumber--
 	return nil
 }
 
@@ -606,9 +619,7 @@ func SetSenderKNI(IN *Flow, kni *Kni) error {
 	if err := checkFlow(IN); err != nil {
 		return err
 	}
-	addSender(kni.portId, -1, IN.current)
-	IN.current = nil
-	openFlowsNumber--
+	addSender(kni.portId, -1, finishFlow(IN))
 	return nil
 }
 
@@ -619,14 +630,11 @@ func SetCopier(IN *Flow) (OUT *Flow, err error) {
 	if err := checkFlow(IN); err != nil {
 		return nil, err
 	}
-	OUT = new(Flow)
 	ringFirst := low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
 	ringSecond := low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
-	openFlowsNumber++
 	addCopier(IN.current, ringFirst, ringSecond)
 	IN.current = ringFirst
-	OUT.current = ringSecond
-	return OUT, nil
+	return newFlow(ringSecond), nil
 }
 
 // SetPartitioner adds partition function to flow graph.
@@ -641,17 +649,15 @@ func SetPartitioner(IN *Flow, N uint64, M uint64) (OUT *Flow, err error) {
 	if err := checkFlow(IN); err != nil {
 		return nil, err
 	}
-	OUT = new(Flow)
 	if N == 0 || M == 0 {
 		common.LogWarning(common.Initialization, "One of SetPartitioner function's arguments is zero.")
 	}
-	ringFirst := low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
-	ringSecond := low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
-	openFlowsNumber++
-	addPartitioner(IN.current, ringFirst, ringSecond, N, M)
-	IN.current = ringFirst
-	OUT.current = ringSecond
-	return OUT, nil
+	partition := makePartitioner(N, M)
+	ctx := new(partitionCtx)
+	ctx.N = N
+	ctx.M = M
+	lineInsert(IN, partition, false, *ctx)
+	return newFlowLine(IN.line, &partition.next[1]), nil
 }
 
 // SetSeparator adds separate function to flow graph.
@@ -663,14 +669,9 @@ func SetSeparator(IN *Flow, f func(*packet.Packet, UserContext) bool, context Us
 	if err := checkFlow(IN); err != nil {
 		return nil, err
 	}
-	OUT = new(Flow)
-	ringTrue := low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
-	ringFalse := low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
-	openFlowsNumber++
-	addSeparator(IN.current, ringTrue, ringFalse, SeparateFunction(f), nil, "separator", context)
-	IN.current = ringTrue
-	OUT.current = ringFalse
-	return OUT, nil
+	separate := makeSeparator(SeparateFunction(f))
+	lineInsert(IN, separate, false, context)
+	return newFlowLine(IN.line, &separate.next[1]), nil
 }
 
 // SetVectorSeparator adds vector separate function to flow graph.
@@ -679,16 +680,16 @@ func SetSeparator(IN *Flow, f func(*packet.Packet, UserContext) bool, context Us
 // user defined function returns "true" and is sent to new flow otherwise.
 // Function can panic during execution.
 func SetVectorSeparator(IN *Flow, f func([]*packet.Packet, []bool, uint, UserContext), context UserContext) (OUT *Flow, err error) {
-	if err := checkFlow(IN); err != nil {
-		return nil, err
-	}
-	OUT = new(Flow)
-	ringTrue := low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
-	ringFalse := low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
-	openFlowsNumber++
-	addSeparator(IN.current, ringTrue, ringFalse, nil, VectorSeparateFunction(f), "vector separator", context)
-	IN.current = ringTrue
-	OUT.current = ringFalse
+	//if err := checkFlow(IN); err != nil {
+	//	return nil, err
+	//}
+	//OUT = new(Flow)
+	//ringTrue := low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
+	//ringFalse := low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
+	//openFlowsNumber++
+	//addSeparator(IN.current, ringTrue, ringFalse, nil, VectorSeparateFunction(f), "vector separator", context)
+	//IN.current = ringTrue
+	//OUT.current = ringFalse
 	return OUT, nil
 }
 
@@ -703,16 +704,11 @@ func SetSplitter(IN *Flow, splitFunction SplitFunction, flowNumber uint, context
 		return nil, err
 	}
 	OutArray = make([](*Flow), flowNumber, flowNumber)
-	rings := make([](*low.Ring), flowNumber, flowNumber)
+	split := makeSplitter(splitFunction)
 	for i := range OutArray {
-		OutArray[i] = new(Flow)
-		openFlowsNumber++
-		rings[i] = low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
-		OutArray[i].current = rings[i]
+		OutArray[i] = newFlowLine(IN.line, &split.next[i])
 	}
-	addSplitter(IN.current, rings, splitFunction, flowNumber, context)
-	IN.current = nil
-	openFlowsNumber--
+	lineInsert(IN, split, true, context)
 	return OutArray, nil
 }
 
@@ -723,9 +719,13 @@ func SetStopper(IN *Flow) error {
 	if err := checkFlow(IN); err != nil {
 		return err
 	}
-	merge(IN.current, schedState.StopRing)
-	IN.current = nil
-	openFlowsNumber--
+	if IN.line == nil {
+		merge(IN.current, schedState.StopRing)
+		closeFlow(IN)
+	} else {
+		ms := makeSlice(schedState.StopRing, IN.line)
+		lineInsert(IN, ms, true, nil)
+	}
 	return nil
 }
 
@@ -738,9 +738,8 @@ func SetHandler(IN *Flow, f func(*packet.Packet, UserContext), context UserConte
 	if err := checkFlow(IN); err != nil {
 		return err
 	}
-	ring := low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
-	addHandler(IN.current, ring, HandleFunction(f), nil, "handler", context)
-	IN.current = ring
+	handle := makeHandler(HandleFunction(f))
+	lineInsert(IN, handle, false, context)
 	return nil
 }
 
@@ -750,12 +749,12 @@ func SetHandler(IN *Flow, f func(*packet.Packet, UserContext), context UserConte
 // and sent further in the same flow.
 // Function can panic during execution.
 func SetVectorHandler(IN *Flow, f func([]*packet.Packet, uint, UserContext), context UserContext) error {
-	if err := checkFlow(IN); err != nil {
-		return err
-	}
-	ring := low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
-	addHandler(IN.current, ring, nil, VectorHandleFunction(f), "vector handler", context)
-	IN.current = ring
+	//if err := checkFlow(IN); err != nil {
+	//	return err
+	//}
+	//ring := low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
+	//addHandler(IN.current, ring, nil, VectorHandleFunction(f), "vector handler", context)
+	//IN.current = ring
 	return nil
 }
 
@@ -768,9 +767,9 @@ func SetHandlerDrop(IN *Flow, f func(*packet.Packet, UserContext) bool, context 
 	if err := checkFlow(IN); err != nil {
 		return err
 	}
-	ring := low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
-	addSeparator(IN.current, ring, schedState.StopRing, SeparateFunction(f), nil, "handler", context)
-	IN.current = ring
+	separate := makeSeparator(SeparateFunction(f))
+	lineInsert(IN, separate, false, context)
+	SetStopper(newFlowLine(IN.line, &separate.next[1]))
 	return nil
 }
 
@@ -780,12 +779,12 @@ func SetHandlerDrop(IN *Flow, f func(*packet.Packet, UserContext) bool, context 
 // If user function returns false after handling a packet it is dropped automatically.
 // Function can panic during execution.
 func SetVectorHandlerDrop(IN *Flow, f func([]*packet.Packet, []bool, uint, UserContext), context UserContext) error {
-	if err := checkFlow(IN); err != nil {
-		return err
-	}
-	ring := low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
-	addSeparator(IN.current, ring, schedState.StopRing, nil, VectorSeparateFunction(f), "vector handler", context)
-	IN.current = ring
+	//if err := checkFlow(IN); err != nil {
+	//	return err
+	//}
+	//ring := low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
+	//addSeparator(IN.current, ring, schedState.StopRing, nil, VectorSeparateFunction(f), "vector handler", context)
+	//IN.current = ring
 	return nil
 }
 
@@ -793,15 +792,20 @@ func SetVectorHandlerDrop(IN *Flow, f func([]*packet.Packet, []bool, uint, UserC
 // Gets any number of flows. Returns new opened flow.
 // All input flows will be closed. All packets from all these flows will be sent to new flow.
 // This function isn't use any cores. It changes output flows of other functions at initialization stage.
+// TODO
 func SetMerger(InArray ...*Flow) (OUT *Flow, err error) {
 	ring := low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
 	for i := range InArray {
 		if err := checkFlow(InArray[i]); err != nil {
 			return nil, err
 		}
-		merge(InArray[i].current, ring)
-		InArray[i].current = nil
-		openFlowsNumber--
+		if InArray[i].line == nil {
+			merge(InArray[i].current, ring)
+			closeFlow(InArray[i])
+		} else {
+			ms := makeSlice(ring, InArray[i].line)
+			lineInsert(InArray[i], ms, true, nil)
+		}
 	}
 	OUT = new(Flow)
 	OUT.current = ring
@@ -812,6 +816,169 @@ func SetMerger(InArray ...*Flow) (OUT *Flow, err error) {
 // GetPortMACAddress returns default MAC address of an Ethernet port.
 func GetPortMACAddress(port uint8) [common.EtherAddrLen]uint8 {
 	return low.GetPortMACAddress(port)
+}
+
+// Service functions for Flow
+func newFlow(ring *low.Ring) *Flow {
+	OUT := new(Flow)
+	OUT.current = ring
+	openFlowsNumber++
+	return OUT
+}
+
+func newFlowLine(line *processLine, previous **sFunc) *Flow {
+	OUT := newFlow(nil)
+	OUT.line = line
+	OUT.previous = previous
+	return OUT
+}
+
+func finishFlow(IN *Flow) *low.Ring {
+	var ring *low.Ring
+	if IN.line == nil {
+		ring = IN.current
+	} else {
+		ring = low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
+		ms := makeSlice(ring, IN.line)
+		lineInsert(IN, ms, true, nil)
+	}
+	closeFlow(IN)
+	return ring
+}
+
+func closeFlow(IN *Flow) {
+	IN.current = nil
+	openFlowsNumber--
+}
+
+func lineInsert(IN *Flow, f *sFunc, willClose bool, context UserContext) {
+	if IN.line == nil {
+		IN.line = addLine(IN.current, f)
+	} else {
+		*IN.previous = f
+	}
+	if willClose {
+		closeFlow(IN)
+	} else {
+		IN.previous = &f.next[0]
+	}
+	IN.line.contexts = append(IN.line.contexts, &context)
+	f.contextIndex = len(IN.line.contexts)
+}
+
+func lineProcess(parameters interface{}, stopper chan int, report chan uint64, context []UserContext) {
+	// For scalar and vector parts
+	lp := parameters.(*lineParameters)
+	IN := lp.in
+	OUT := *lp.out
+	scalar := (lp.firstSFunc != nil)
+	outNumber := len(*lp.out)
+	InputMbufs := make([]uintptr, burstSize, burstSize)
+	OutputMbufs := make([][]uintptr, outNumber)
+	countOfPackets := make([]int, outNumber)
+	for index := range OutputMbufs {
+		OutputMbufs[index] = make([]uintptr, burstSize)
+		countOfPackets[index] = 0
+	}
+	var currentSpeed uint64
+	tick := time.Tick(time.Duration(schedTime) * time.Millisecond)
+	var pause int
+	// For scalar part
+	firstFuncS := lp.firstSFunc
+	var tempPacket *packet.Packet
+	var tempPacketAddr uintptr
+	// For vector part
+	firstFuncV := lp.firstVFunc
+	tempPackets := make([]*packet.Packet, burstSize)
+	type pair struct {
+		f    *vFunc
+		mask [burstSize]bool
+	}
+	def := make([]pair, 30, 30)
+	var answers [burstSize]uint8
+
+	for {
+		select {
+		case pause = <-stopper:
+			if pause == -1 {
+				// It is time to close this clone
+				close(stopper)
+				for i := range context {
+					if context[i] != nil {
+						context[i].Delete()
+					}
+				}
+				// We don't close report channel because all clones of one function use it.
+				// As one function entity will be working endlessly we don't close it anywhere.
+				return
+			}
+		case <-tick:
+			report <- currentSpeed
+			currentSpeed = 0
+		default:
+			n := IN.DequeueBurst(InputMbufs, burstSize)
+			if n == 0 {
+				if pause != 0 {
+					time.Sleep(time.Duration(pause) * time.Nanosecond)
+				}
+				continue
+			}
+			// TODO prefetch
+			// Scalar code
+			if scalar {
+				currentFunc := firstFuncS
+				for i := uint(0); i < n; i++ {
+					tempPacketAddr = packet.ExtractPacketAddr(InputMbufs[i])
+					tempPacket = packet.ToPacket(tempPacketAddr)
+					for {
+						nextIndex := currentFunc.Func(tempPacket, currentFunc, context[currentFunc.contextIndex])
+						if nextIndex < 0 {
+							// Previous func was constructSlice
+							index := nextIndex*-1 - 1
+							OutputMbufs[index][countOfPackets[index]] = InputMbufs[i]
+							countOfPackets[index]++
+							break
+						}
+						currentFunc = currentFunc.next[nextIndex]
+					}
+					for index := 0; index < outNumber; index++ {
+						if countOfPackets[index] == 0 {
+							continue
+						}
+						safeEnqueue(OUT[index], OutputMbufs[index], uint(countOfPackets[index]))
+						currentSpeed += uint64(countOfPackets[index])
+						countOfPackets[index] = 0
+					}
+				}
+				// Vector code
+			} else {
+				packet.ExtractPackets(tempPackets, InputMbufs, n)
+				def[0].f = firstFuncV
+				st := 0
+				for st != 0 {
+					cur := def[st].f
+					cur.Func(tempPackets, &def[st].mask, &answers, cur)
+					if cur.followingNumber == 0 {
+						count := FillSliceFromMask(InputMbufs, &def[st].mask, OutputMbufs[0])
+						safeEnqueue(OUT[answers[0]], OutputMbufs[0], uint(count))
+						currentSpeed += uint64(count)
+					}
+					if cur.followingNumber == 1 {
+						// Mask remain the same
+						def[st].f = cur.next[0]
+					}
+					for i := len(cur.next) - 1; i >= 0; i-- {
+						cont := asm.GenerateMask(&answers, &(vEach[i]), &def[st].mask)
+						if !cont {
+							def[st].f = cur.next[i]
+							st++
+						}
+					}
+					st--
+				}
+			}
+		}
+	}
 }
 
 func recvRSS(parameters interface{}, flag *int, coreID int) {
@@ -838,7 +1005,7 @@ func generateOne(parameters interface{}) {
 	}
 }
 
-func generatePerf(parameters interface{}, stopper chan int, report chan uint64, context UserContext) {
+func generatePerf(parameters interface{}, stopper chan int, report chan uint64, context []UserContext) {
 	gp := parameters.(*generateParameters)
 	OUT := gp.out
 	generateFunction := gp.generateFunction
@@ -859,8 +1026,8 @@ func generatePerf(parameters interface{}, stopper chan int, report chan uint64, 
 			if pause == -1 {
 				// It is time to close this clone
 				close(stopper)
-				if context != nil {
-					context.Delete()
+				if context[0] != nil {
+					context[0].Delete()
 				}
 				// We don't close report channel because all clones of one function use it.
 				// As one function entity will be working endlessly we don't close it anywhere.
@@ -878,11 +1045,11 @@ func generatePerf(parameters interface{}, stopper chan int, report chan uint64, 
 				for i := range bufs {
 					// TODO Maybe we need to prefetcht here?
 					tempPacket = packet.ExtractPacket(bufs[i])
-					generateFunction(tempPacket, context)
+					generateFunction(tempPacket, context[0])
 				}
 			} else {
 				packet.ExtractPackets(tempPackets, bufs, burstSize)
-				vectorGenerateFunction(tempPackets, burstSize, context)
+				vectorGenerateFunction(tempPackets, burstSize, context[0])
 			}
 			safeEnqueue(OUT, bufs, burstSize)
 			currentSpeed = currentSpeed + uint64(burstSize)
@@ -899,7 +1066,7 @@ func generatePerf(parameters interface{}, stopper chan int, report chan uint64, 
 }
 
 // TODO reassembled packets are not supported
-func pcopy(parameters interface{}, stopper chan int, report chan uint64, context UserContext) {
+func pcopy(parameters interface{}, stopper chan int, report chan uint64, context []UserContext) {
 	cp := parameters.(*copyParameters)
 	IN := cp.in
 	OUT := cp.out
@@ -973,13 +1140,6 @@ func merge(from *low.Ring, to *low.Ring) {
 			if schedState.ff[i].Parameters.(*receiveParameters).out == from {
 				schedState.ff[i].Parameters.(*receiveParameters).out = to
 			}
-		case *partitionParameters:
-			if schedState.ff[i].Parameters.(*partitionParameters).outFirst == from {
-				schedState.ff[i].Parameters.(*partitionParameters).outFirst = to
-			}
-			if schedState.ff[i].Parameters.(*partitionParameters).outSecond == from {
-				schedState.ff[i].Parameters.(*partitionParameters).outSecond = to
-			}
 		case *generateParameters:
 			if schedState.ff[i].Parameters.(*generateParameters).out == from {
 				schedState.ff[i].Parameters.(*generateParameters).out = to
@@ -995,293 +1155,57 @@ func merge(from *low.Ring, to *low.Ring) {
 			if schedState.ff[i].Parameters.(*copyParameters).outCopy == from {
 				schedState.ff[i].Parameters.(*copyParameters).outCopy = to
 			}
-		case *splitParameters:
-			for j := uint(0); j < schedState.ff[i].Parameters.(*splitParameters).flowNumber; j++ {
-				if schedState.ff[i].Parameters.(*splitParameters).outs[j] == from {
-					schedState.ff[i].Parameters.(*splitParameters).outs[j] = to
-				}
-			}
-		case *separateParameters:
-			if schedState.ff[i].Parameters.(*separateParameters).outTrue == from {
-				schedState.ff[i].Parameters.(*separateParameters).outTrue = to
-			}
-			if schedState.ff[i].Parameters.(*separateParameters).outFalse == from {
-				schedState.ff[i].Parameters.(*separateParameters).outFalse = to
-			}
-		case *handleParameters:
-			if schedState.ff[i].Parameters.(*handleParameters).out == from {
-				schedState.ff[i].Parameters.(*handleParameters).out = to
-			}
 		}
 	}
 }
 
-func separate(parameters interface{}, stopper chan int, report chan uint64, context UserContext) {
-	sp := parameters.(*separateParameters)
-	IN := sp.in
-	OUTTrue := sp.outTrue
-	OUTFalse := sp.outFalse
-	separateFunction := sp.separateFunction
-	vectorSeparateFunction := sp.vectorSeparateFunction
-	vector := (vectorSeparateFunction != nil)
-
-	bufsIn := make([]uintptr, burstSize)
-	bufsTrue := make([]uintptr, burstSize)
-	bufsFalse := make([]uintptr, burstSize)
-	ttt := make([]bool, burstSize)
-	var countOfPackets uint
-	var tempPacket *packet.Packet
-	var tempPacketAddr uintptr
-	tempPackets := make([]*packet.Packet, burstSize)
-	var currentSpeed uint64
-	tick := time.Tick(time.Duration(schedTime) * time.Millisecond)
-	var pause int
-
-	for {
-		select {
-		case pause = <-stopper:
-			if pause == -1 {
-				// It is time to close this clone
-				close(stopper)
-				if context != nil {
-					context.Delete()
-				}
-				// We don't close report channel because all clones of one function use it.
-				// As one function entity will be working endlessly we don't close it anywhere.
-				return
-			}
-		case <-tick:
-			report <- currentSpeed
-			currentSpeed = 0
-		default:
-			n := IN.DequeueBurst(bufsIn, burstSize)
-			if n == 0 {
-				if pause != 0 {
-					time.Sleep(time.Duration(pause) * time.Nanosecond)
-				}
-				continue
-			}
-			countOfPackets = 0
-			if vector == false {
-				tempPacketAddr = packet.ExtractPacketAddr(bufsIn[0])
-				// TODO here and in following flow functions: Now prefetch by zero address is
-				// slowing down the application. However we should use it in the future instead of code duplication.
-				for i := uint(0); i < n-1; i++ {
-					tempPacket = packet.ToPacket(tempPacketAddr)
-					tempPacketAddr = packet.ExtractPacketAddr(bufsIn[i+1])
-					asm.Prefetcht0(tempPacketAddr)
-					if separateFunction(tempPacket, context) == false {
-						bufsFalse[countOfPackets] = bufsIn[i]
-						countOfPackets++
-					} else {
-						bufsTrue[uint(i)-countOfPackets] = bufsIn[i]
-					}
-				}
-				if separateFunction(packet.ToPacket(tempPacketAddr), context) == false {
-					bufsFalse[countOfPackets] = bufsIn[n-1]
-					countOfPackets++
-				} else {
-					bufsTrue[uint(n-1)-countOfPackets] = bufsIn[n-1]
-				}
-			} else {
-				// TODO add prefetch for vector functions
-				packet.ExtractPackets(tempPackets, bufsIn, n)
-				vectorSeparateFunction(tempPackets, ttt, n, context)
-				for i := uint(0); i < n; i++ {
-					if ttt[i] == false {
-						bufsFalse[countOfPackets] = bufsIn[i]
-						countOfPackets++
-					} else {
-						bufsTrue[uint(i)-countOfPackets] = bufsIn[i]
-					}
-				}
-			}
-			if countOfPackets != 0 {
-				safeEnqueue(OUTFalse, bufsFalse, countOfPackets)
-			}
-			if countOfPackets != uint(n) {
-				c := n - countOfPackets
-				safeEnqueue(OUTTrue, bufsTrue, uint(c))
-			}
-			currentSpeed += uint64(n)
-		}
+func separate(packet *packet.Packet, sc *sFunc, ctx UserContext) int {
+	if sc.separateFunction(packet, ctx) == true {
+		return 0
 	}
+	return 1
 }
 
-func partition(parameters interface{}) {
-	cp := parameters.(*partitionParameters)
-	IN := cp.in
-	OUTFirst := cp.outFirst
-	OUTSecond := cp.outSecond
-	N := cp.N
-	M := cp.M
-
-	bufsIn := make([]uintptr, burstSize)
-	bufsFirst := make([]uintptr, burstSize)
-	bufsSecond := make([]uintptr, burstSize)
-	var countOfPackets uint
-	currentPacketNumber := uint64(0)
-	sw := true
-	for {
-		n := IN.DequeueBurst(bufsIn, burstSize)
-		if n == 0 {
-			continue
-		}
-		countOfPackets = 0
-		for i := uint(0); i < n; i++ {
-			currentPacketNumber++
-			if sw == true {
-				bufsFirst[countOfPackets] = bufsIn[i]
-				countOfPackets++
-				if currentPacketNumber == N {
-					sw = false
-					currentPacketNumber = 0
-				}
-			} else {
-				bufsSecond[uint(i)-countOfPackets] = bufsIn[i]
-				if currentPacketNumber == M {
-					sw = true
-					currentPacketNumber = 0
-				}
-			}
-		}
-		if countOfPackets != 0 {
-			safeEnqueue(OUTFirst, bufsFirst, countOfPackets)
-		}
-		if countOfPackets != uint(n) {
-			c := n - countOfPackets
-			safeEnqueue(OUTSecond, bufsSecond, uint(c))
-		}
-	}
+func vSeparate(packets []*packet.Packet, mask *[burstSize]bool, answers *[burstSize]uint8, ve *vFunc, ctx UserContext) {
+	ve.separateFunction(packets, mask, answers, ctx)
 }
 
-func split(parameters interface{}, stopper chan int, report chan uint64, context UserContext) {
-	sp := parameters.(*splitParameters)
-	IN := sp.in
-	OUT := sp.outs
-	splitFunction := sp.splitFunction
-	flowNumber := sp.flowNumber
-
-	InputMbufs := make([]uintptr, burstSize)
-	OutputMbufs := make([][]uintptr, flowNumber)
-	countOfPackets := make([]int, flowNumber)
-	for index := range OutputMbufs {
-		OutputMbufs[index] = make([]uintptr, burstSize)
-		countOfPackets[index] = 0
+// partition doesn't need packets - just mbufs. However it will probably be
+// among other functions. So this overhead is not much.
+func partition(packet *packet.Packet, sc *sFunc, ctx UserContext) int {
+	context := ctx.(partitionCtx)
+	context.currentPacketNumber++
+	if context.currentPacketNumber == context.currentCompare {
+		context.currentAnswer = context.currentAnswer ^ 1
+		context.currentCompare = context.N + context.M - context.currentCompare
+		context.currentPacketNumber = 0
 	}
-	var tempPacket *packet.Packet
-	var tempPacketAddr uintptr
-	var currentSpeed uint64
-	tick := time.Tick(time.Duration(schedTime) * time.Millisecond)
-	var pause int
-
-	for {
-		select {
-		case pause = <-stopper:
-			if pause == -1 {
-				// It is time to close this clone
-				close(stopper)
-				if context != nil {
-					context.Delete()
-				}
-				// We don't close report channel because all clones of one function use it.
-				// As one function entity will be working endlessly we don't close it anywhere.
-				return
-			}
-		case <-tick:
-			report <- currentSpeed
-			currentSpeed = 0
-		default:
-			n := IN.DequeueBurst(InputMbufs, burstSize)
-			if n == 0 {
-				if pause != 0 {
-					time.Sleep(time.Duration(pause) * time.Nanosecond)
-				}
-				continue
-			}
-			tempPacketAddr = packet.ExtractPacketAddr(InputMbufs[0])
-			for i := uint(0); i < n-1; i++ {
-				tempPacket = packet.ToPacket(tempPacketAddr)
-				tempPacketAddr = packet.ExtractPacketAddr(InputMbufs[i+1])
-				asm.Prefetcht0(tempPacketAddr)
-				index := splitFunction(tempPacket, context)
-				OutputMbufs[index][countOfPackets[index]] = InputMbufs[i]
-				countOfPackets[index]++
-			}
-			index := splitFunction(packet.ToPacket(tempPacketAddr), context)
-			OutputMbufs[index][countOfPackets[index]] = InputMbufs[n-1]
-			countOfPackets[index]++
-
-			for index := uint(0); index < flowNumber; index++ {
-				if countOfPackets[index] == 0 {
-					continue
-				}
-				safeEnqueue(OUT[index], OutputMbufs[index], uint(countOfPackets[index]))
-				currentSpeed += uint64(countOfPackets[index])
-				countOfPackets[index] = 0
-			}
-		}
-	}
+	return context.currentAnswer
 }
 
-func handle(parameters interface{}, stopper chan int, report chan uint64, context UserContext) {
-	sp := parameters.(*handleParameters)
-	IN := sp.in
-	OUT := sp.out
-	handleFunction := sp.handleFunction
-	vectorHandleFunction := sp.vectorHandleFunction
-	vector := (vectorHandleFunction != nil)
+func split(packet *packet.Packet, sc *sFunc, ctx UserContext) int {
+	return int(sc.splitFunction(packet, ctx))
+}
 
-	bufs := make([]uintptr, burstSize)
-	var tempPacket *packet.Packet
-	var tempPacketAddr uintptr
-	tempPackets := make([]*packet.Packet, burstSize)
-	var currentSpeed uint64
-	tick := time.Tick(time.Duration(schedTime) * time.Millisecond)
-	var pause int
+func vSplit(packets []*packet.Packet, mask *[burstSize]bool, answers *[burstSize]uint8, ve *vFunc, ctx UserContext) {
+	ve.splitFunction(packets, mask, answers, ctx)
+}
 
-	for {
-		select {
-		case pause = <-stopper:
-			if pause == -1 {
-				// It is time to close this clone
-				close(stopper)
-				if context != nil {
-					context.Delete()
-				}
-				// We don't close report channel because all clones of one function use it.
-				// As one function entity will be working endlessly we don't close it anywhere.
-				return
-			}
-		case <-tick:
-			report <- currentSpeed
-			currentSpeed = 0
-		default:
-			n := IN.DequeueBurst(bufs, burstSize)
-			if n == 0 {
-				if pause != 0 {
-					time.Sleep(time.Duration(pause) * time.Nanosecond)
-				}
-				continue
-			}
-			if vector == false {
-				tempPacketAddr = packet.ExtractPacketAddr(bufs[0])
-				for i := uint(0); i < n-1; i++ {
-					tempPacket = packet.ToPacket(tempPacketAddr)
-					tempPacketAddr = packet.ExtractPacketAddr(bufs[i+1])
-					asm.Prefetcht0(tempPacketAddr)
-					handleFunction(tempPacket, context)
-				}
-				handleFunction(packet.ToPacket(tempPacketAddr), context)
-			} else {
-				// TODO add prefetch for vector functions
-				packet.ExtractPackets(tempPackets, bufs, n)
-				vectorHandleFunction(tempPackets, n, context)
-			}
-			safeEnqueue(OUT, bufs, uint(n))
-			currentSpeed += uint64(n)
-		}
-	}
+func handle(packet *packet.Packet, sc *sFunc, ctx UserContext) int {
+	sc.handleFunction(packet, ctx)
+	return 0
+}
+
+func vHandle(packets []*packet.Packet, mask *[burstSize]bool, answers *[burstSize]uint8, ve *vFunc, ctx UserContext) {
+	ve.handleFunction(packets, mask, answers, ctx)
+}
+
+func constructSlice(packet *packet.Packet, sc *sFunc, ctx UserContext) int {
+	return -1 * sc.bufIndex
+}
+
+func vConstructSlice(packets []*packet.Packet, mask [burstSize]bool, answers [burstSize]uint8, ve *vFunc, ctx UserContext) {
+	answers[0] = uint8(ve.bufIndex)
 }
 
 func write(parameters interface{}) {
@@ -1410,4 +1334,15 @@ func CreateKniDevice(portId uint8, core uint8, name string) *Kni {
 	// KNI structure itself is stored inside low.c
 	kni.portId = portId
 	return kni
+}
+
+func FillSliceFromMask(input []uintptr, mask *[burstSize]bool, output []uintptr) uint8 {
+	count := 0
+	for i := 0; i < burstSize; i++ {
+		if (*mask)[i] != false {
+			output[count] = input[i]
+			count++
+		}
+	}
+	return uint8(count)
 }
